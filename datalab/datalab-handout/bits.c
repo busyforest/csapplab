@@ -332,8 +332,42 @@ int howManyBits(int x) {
  *   Max ops: 30
  *   Rating: 4
  */
+ // mask1 = 0 00000000 1...111
+ // mask2 = 0 11111111 0...000
+ // mask3 = 1 00000000 0...000
+ // 分别利用掩码来获取各个部分的数值，并根据法则进行位级运算实现即可
 unsigned floatScale2(unsigned uf) {
-  return 2;
+  int i = 1;
+  unsigned mask1 = 1;
+  unsigned mask2;
+  unsigned mask3;
+  unsigned m;
+  unsigned e;
+  unsigned s;
+  while(i < 32){
+    if(i < 23){
+      mask1 = (mask1 << 1) + 1;
+      mask2 = mask1;
+    }else if(i < 31){
+      mask2 = (mask2 << 1) + 1;
+    }else{
+      mask3 = (mask2 << 1) + 1 - mask2;
+      mask2 -= mask1;
+    }
+    i++;
+  }
+  m = uf & mask1; // 尾数
+  e = uf & mask2; // 阶码
+  s = uf & mask3; // 符号位
+  if(e == 0){
+    return (m << 1)| e | s;
+  }else if(e == mask2){
+    return uf;
+  }else{
+    unsigned e1 = ((e >> 23) + 1) << 23;
+    return e1| m | s;
+  }
+  return 0;
 }
 /* 
  * floatFloat2Int - Return bit-level equivalent of expression (int) f
@@ -347,8 +381,24 @@ unsigned floatScale2(unsigned uf) {
  *   Max ops: 30
  *   Rating: 4
  */
+ // 才注意到 float coding rule 已经取消了对常量值 0~0xFF 的限制，那直接用数值做掩码就简单多了
+ // 同样是根据法则进行位级运算处理即可
 int floatFloat2Int(unsigned uf) {
-  return 2;
+  unsigned s = uf & 0x80000000; 
+  int e = ((uf >> 23) & 0xFF) - 127;  
+  unsigned m = (uf & 0x7FFFFF) | 0x800000; // 添加隐含的 1
+  if(((uf >> 23) & 0xFF) == 0xFF){
+    return 0x80000000; // NaN 或者 inf
+  }else if(e < 0){
+    return 0; //阶码小于 0，在(-1, 1)中 
+  }else if(e >= 31){
+    return 0x80000000;//太大了，超出 int 范围
+  }else if(e > 23){
+    m <<= e - 23; // 若指数较大，需要左移
+  }else{
+    m >>= 23 - e; // 若指数较小，需要右移
+  }
+  return s ? -m : m;
 }
 /* 
  * floatPower2 - Return bit-level equivalent of the expression 2.0^x
@@ -364,7 +414,14 @@ int floatFloat2Int(unsigned uf) {
  *   Rating: 4
  */
 unsigned floatPower2(int x) {
-    return 2;
+  unsigned e;
+  if(x < -126){
+      return 0; 
+  }else if (x > 127){
+    return 0x7f800000; 
+  }
+  e = x + 127;
+  return e << 23;
 }
 
 
