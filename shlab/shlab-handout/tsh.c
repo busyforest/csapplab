@@ -1,7 +1,9 @@
 /* 
  * tsh - A tiny shell program with job control
  * 
- * <Put your name and login ID here>
+ * Name: Bao Xu
+ * StudentID: 22302010017
+ *
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,8 +165,101 @@ int main(int argc, char **argv)
  * background children don't receive SIGINT (SIGTSTP) from the kernel
  * when we type ctrl-c (ctrl-z) at the keyboard.  
 */
+
+/* Error wrapper function */
+pid_t Fork(void);
+void Sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+void Sigemptyset(sigset_t *set);
+void Sigfillset(sigset_t *set);
+void Sigaddset(sigset_t *set, int signum);
+void Execve(const char *filename, char *const argv[], char *const envp[]);
+void Setpgid(pid_t pid, pid_t pgid);
+void Kill(pid_t pid, int sig);
+pid_t Fork(void){
+    pid_t pid;
+    if((pid = fork()) < 0)
+        unix_error("Fork error");
+    return pid;
+}
+void Sigprocmask(int how, const sigset_t *set, sigset_t *oldset){
+    if(sigprocmask(how, set, oldset) < 0)
+        unix_error("Sigprocmask error");
+}
+void Sigemptyset(sigset_t *set){
+    if(sigemptyset(set) < 0)
+        unix_error("Sigprocmask error");
+}
+void Sigfillset(sigset_t *set){
+    if(sigfillset(set) < 0)
+        unix_error("Sigfillset error");
+}
+void Sigaddset(sigset_t *set, int signum){
+    if(sigaddset(set, signum) < 0)
+        unix_error("Sigaddset error");
+}
+void Execve(const char *filename, char *const argv[], char *const envp[]){
+    if(execve(filename, argv, envp) < 0){
+        printf("%s: Command not found\n", argv[0]);
+    }
+}
+void Setpgid(pid_t pid, pid_t pgid){
+    if(setpgid(pid, pgid) < 0){
+        unix_error("Setpid error");
+    }
+}
+void Kill(pid_t pid, int sig){
+    if(kill(pid, sig) < 0){
+        unix_error("Kill error");
+    }
+}
+
 void eval(char *cmdline) 
 {
+    char *argv[MAXARGS];
+    char buf[MAXLINE];
+    int state;
+    pid_t pid;
+
+    sigset_t all_masks, temp_mask, prev_mask;
+
+    strcpy(buf, cmdline);
+    state = parseline(buf, argv) ? BG : FG;
+    if(argv[0] == NULL){
+        return;
+    }
+    Sigfillset(&all_masks);
+    Sigemptyset(&temp_mask);
+    Sigaddset(&temp_mask, SIGCHLD);
+    if(!builtin_cmd(argv)){
+        // fork 前阻塞 SIG_BLOCK，标准做法，避免后面 addjob 之前子进程已经跑完
+        Sigprocmask(SIG_BLOCK, &temp_mask, &prev_mask);
+        if((pid = fork()) == 0){
+            // 子进程代码
+            // 取消对 SIG_BLOCK 的屏蔽，使得子进程能正常接受 SIG_BLOCK 信号
+            Sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+            Setpgid(0, 0);
+            Execve(argv[0], argv, environ);
+            // Execve 有执行错误的风险，为了避免无法回收要加一个退出代码
+            exit(0);
+        }
+        // 后台进程
+        // 在 addjob 的时候作业列表属于临界区，要原子性地访问
+        if(state == BG){
+            Sigprocmask(SIG_BLOCK, &all_masks, &prev_mask);
+            addjob(jobs, pid, state, cmdline);
+            // 解除对 SIG_CHILD 的屏蔽，使父进程可以正常回收子进程
+            Sigprocmask(SIG_SETMASK, &temp_mask, NULL);
+            printf("[%d] (%d) %s",pid2jid(pid), pid, cmdline);
+        }else{
+            // 前台进程
+            Sigprocmask(SIG_BLOCK, &all_masks, &prev_mask);
+            addjob(jobs, pid, state, cmdline);
+            // 解除对 SIG_CHILD 的屏蔽，使父进程可以正常回收子进程
+            Sigprocmask(SIG_SETMASK, &temp_mask, NULL);
+            waitfg(pid);
+        }
+        Sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+    }
     return;
 }
 
@@ -230,7 +325,19 @@ int parseline(const char *cmdline, char **argv)
  *    it immediately.  
  */
 int builtin_cmd(char **argv) 
-{
+{   
+    if (!strcmp(argv[0], "quit")){
+        exit(0);
+        return 1;
+    }else if (!strcmp(argv[0], "bg") || !strcmp(argv[0], "fg")) {
+        do_bgfg(argv);
+        return 1;
+    }else if (!strcmp(argv[0], "jobs")) {
+        listjobs(jobs);
+        return 1;
+    }else if(!strcmp(argv[0], "&")){
+        return 1;
+    }      
     return 0;     /* not a builtin command */
 }
 
@@ -239,6 +346,45 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
+    struct job_t *job = NULL;
+    int state;
+    int id;
+    state = strcmp(argv[0], "bg") ? FG : BG;         
+    if(argv[1]==NULL){
+        printf("%s command requires PID or %%jobid argument\n", argv[0]);
+        return;
+    }
+    // 通过 jid 查找
+    if(argv[1][0]=='%'){
+       if(sscanf(&argv[1][1], "%d", &id) > 0){
+            job = getjobjid(jobs, id);
+            if(job==NULL){
+                printf("%%%d: No such job\n", id);
+                return;
+            }
+        }
+    }else if(!isdigit(argv[1][0])) {  
+        // 非法输入，报错
+        printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+        return;
+    }else{
+        // 通过 pid 查找
+        id = atoi(argv[1]);
+        job = getjobpid(jobs, id);
+        if(job==NULL){
+            printf("(%d): No such process\n", id);
+            return;
+        }
+
+    }
+    // 向整个进程组发信号以恢复执行
+    Kill(-(job->pid), SIGCONT);
+    job->state = state;
+    if(state==BG){
+        printf("[%d] (%d) %s",job->jid, job->pid, job->cmdline);
+    }else{ 
+        waitfg(job->pid);
+    }
     return;
 }
 
@@ -247,6 +393,12 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+    sigset_t empty_mask;
+    Sigemptyset(&empty_mask);   
+    while (fgpid(jobs) != 0){
+        // 恢复对"空信号集"的屏蔽，即允许所有信号进入，并挂起等待信号到来
+        sigsuspend(&empty_mask);
+    }
     return;
 }
 
@@ -261,8 +413,38 @@ void waitfg(pid_t pid)
  *     available zombie children, but doesn't wait for any other
  *     currently running children to terminate.  
  */
+// errno 是全局变量，在进行 handler 处理时可能会修改 errno
+// 所以要执行前存储，执行后恢复 
 void sigchld_handler(int sig) 
 {
+    int olderrno = errno;
+    int status;
+    pid_t pid;
+    struct job_t *job;
+    sigset_t all_masks, prev_mask;
+    sigfillset(&all_masks);
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0){
+        // 即将访问临界区，屏蔽所有信号
+        sigprocmask(SIG_BLOCK, &all_masks, &prev_mask);
+        // 进程正常退出
+        if (WIFEXITED(status)){
+            deletejob(jobs, pid);
+        }
+        // 进程收到信号终止
+        else if (WIFSIGNALED(status)){
+            printf ("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, WTERMSIG(status));
+            deletejob(jobs, pid);
+        }
+        // 进程收到信号停止
+        else if (WIFSTOPPED(status)){
+            printf ("Job [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, WSTOPSIG(status));
+            job = getjobpid(jobs, pid);
+            job->state = ST;
+        }
+        // 退出临界区，取消信号屏蔽
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);          
+    }
+    errno = olderrno;
     return;
 }
 
@@ -273,6 +455,17 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+    int olderrno = errno;
+    int pid;
+    sigset_t all_masks, prev_mask;
+    Sigfillset(&all_masks);
+    // jobs 属于临界区资源，加上屏蔽之后才能访问
+    Sigprocmask(SIG_BLOCK, &all_masks, &prev_mask);
+    if((pid = fgpid(jobs)) != 0){
+        Kill(-pid, SIGINT);
+    }
+    Sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+    errno = olderrno;
     return;
 }
 
@@ -283,6 +476,16 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    int olderrno = errno;
+    int pid;
+    sigset_t all_masks, prev_mask;
+    Sigfillset(&all_masks);
+    Sigprocmask(SIG_BLOCK, &all_masks, &prev_mask);
+    if((pid = fgpid(jobs)) > 0){
+        Kill(-pid, SIGTSTP);
+    }
+    Sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+    errno = olderrno;
     return;
 }
 
